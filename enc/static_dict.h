@@ -1,40 +1,37 @@
-// Copyright 2013 Google Inc. All Rights Reserved.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-// http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-//
-// Class to model the static dictionary.
+/* Copyright 2013 Google Inc. All Rights Reserved.
+
+   Distributed under MIT license.
+   See file LICENSE for detail or copy at https://opensource.org/licenses/MIT
+*/
+
+/* Class to model the static dictionary. */
 
 #ifndef BROTLI_ENC_STATIC_DICT_H_
 #define BROTLI_ENC_STATIC_DICT_H_
 
-#include <stdint.h>
+#include <brotli/types.h>
+#include "./port.h"
 
-namespace brotli {
+#if defined(__cplusplus) || defined(c_plusplus)
+extern "C" {
+#endif
 
-static const int kMaxDictionaryMatchLen = 37;
-static const int kInvalidMatch = 0xfffffff;
+#define BROTLI_MAX_STATIC_DICTIONARY_MATCH_LEN 37
+static const uint32_t kInvalidMatch = 0xfffffff;
 
-// Matches data against static dictionary words, and for each length l,
-// for which a match is found, updates matches[l] to be the minimum possible
-//   (distance << 5) + len_code.
-// Prerequisites:
-//   matches array is at least kMaxDictionaryMatchLen + 1 long
-//   all elements are initialized to kInvalidMatch
-bool FindAllStaticDictionaryMatches(const uint8_t* data,
-                                    int min_length,
-                                    int max_length,
-                                    int* matches);
+/* Matches data against static dictionary words, and for each length l,
+   for which a match is found, updates matches[l] to be the minimum possible
+     (distance << 5) + len_code.
+   Returns 1 if matches have been found, otherwise 0.
+   Prerequisites:
+     matches array is at least BROTLI_MAX_STATIC_DICTIONARY_MATCH_LEN + 1 long
+     all elements are initialized to kInvalidMatch */
+BROTLI_INTERNAL BROTLI_BOOL BrotliFindAllStaticDictionaryMatches(
+    const uint8_t* data, size_t min_length, size_t max_length,
+    uint32_t* matches);
 
-}  // namespace brotli
+#if defined(__cplusplus) || defined(c_plusplus)
+}  /* extern "C" */
+#endif
 
-#endif  // BROTLI_ENC_STATIC_DICT_H_
+#endif  /* BROTLI_ENC_STATIC_DICT_H_ */

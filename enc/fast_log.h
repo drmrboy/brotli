@@ -1,75 +1,37 @@
-// Copyright 2013 Google Inc. All Rights Reserved.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-// http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-//
-// Utilities for fast computation of logarithms.
+/* Copyright 2013 Google Inc. All Rights Reserved.
+
+   Distributed under MIT license.
+   See file LICENSE for detail or copy at https://opensource.org/licenses/MIT
+*/
+
+/* Utilities for fast computation of logarithms. */
 
 #ifndef BROTLI_ENC_FAST_LOG_H_
 #define BROTLI_ENC_FAST_LOG_H_
 
-#include <assert.h>
 #include <math.h>
-#include <stdint.h>
 
-namespace brotli {
+#include <brotli/types.h>
+#include <brotli/port.h>
 
-// Return floor(log2(n)) for positive integer n.  Returns -1 iff n == 0.
-inline int Log2Floor(uint32_t n) {
-#if defined(__clang__) ||                       \
-  (defined(__GNUC__) &&                                         \
-   ((__GNUC__ == 3 && __GNUC_MINOR__ >= 4) || __GNUC__ >= 4))
-  return n == 0 ? -1 : 31 ^ __builtin_clz(n);
-#else
-  if (n == 0)
-    return -1;
-  int log = 0;
-  uint32_t value = n;
-  for (int i = 4; i >= 0; --i) {
-    int shift = (1 << i);
-    uint32_t x = value >> shift;
-    if (x != 0) {
-      value = x;
-      log += shift;
-    }
-  }
-  assert(value == 1);
-  return log;
+#if defined(__cplusplus) || defined(c_plusplus)
+extern "C" {
 #endif
-}
 
-static inline int Log2FloorNonZero(uint32_t n) {
+static BROTLI_INLINE uint32_t Log2FloorNonZero(size_t n) {
 #ifdef __GNUC__
-  return 31 ^ __builtin_clz(n);
+  return 31u ^ (uint32_t)__builtin_clz((uint32_t)n);
 #else
-  unsigned int result = 0;
+  uint32_t result = 0;
   while (n >>= 1) result++;
   return result;
 #endif
 }
 
-// Return ceiling(log2(n)) for positive integer n.  Returns -1 iff n == 0.
-inline int Log2Ceiling(uint32_t n) {
-  int floor = Log2Floor(n);
-  if (n == (n &~ (n - 1)))              // zero or a power of two
-    return floor;
-  else
-    return floor + 1;
-}
+/* A lookup table for small values of log2(int) to be used in entropy
+   computation.
 
-// A lookup table for small values of log2(int) to be used in entropy
-// computation.
-//
-// ", ".join(["%.16ff" % x for x in [0.0]+[log2(x) for x in range(1, 256)]])
+   ", ".join(["%.16ff" % x for x in [0.0]+[log2(x) for x in range(1, 256)]]) */
 static const float kLog2Table[] = {
   0.0000000000000000f, 0.0000000000000000f, 1.0000000000000000f,
   1.5849625007211563f, 2.0000000000000000f, 2.3219280948873622f,
@@ -159,21 +121,25 @@ static const float kLog2Table[] = {
   7.9943534368588578f
 };
 
-// Faster logarithm for small integers, with the property of log2(0) == 0.
-static inline double FastLog2(int v) {
-  if (v < (int)(sizeof(kLog2Table) / sizeof(kLog2Table[0]))) {
+#define LOG_2_INV 1.4426950408889634
+
+/* Faster logarithm for small integers, with the property of log2(0) == 0. */
+static BROTLI_INLINE double FastLog2(size_t v) {
+  if (v < sizeof(kLog2Table) / sizeof(kLog2Table[0])) {
     return kLog2Table[v];
   }
-#if defined(_MSC_VER) && _MSC_VER <= 1600
-  // Visual Studio 2010 does not have the log2() function defined, so we use
-  // log() and a multiplication instead.
-  static const double kLog2Inv = 1.4426950408889634f;
-  return log(static_cast<double>(v)) * kLog2Inv;
+#if (defined(_MSC_VER) && _MSC_VER <= 1700) || \
+    (defined(__ANDROID_API__) && __ANDROID_API__ < 18)
+  /* Visual Studio 2012 and Android API levels < 18 do not have the log2()
+   * function defined, so we use log() and a multiplication instead. */
+  return log((double)v) * LOG_2_INV;
 #else
-  return log2(static_cast<double>(v));
+  return log2((double)v);
 #endif
 }
 
-}  // namespace brotli
+#if defined(__cplusplus) || defined(c_plusplus)
+}  /* extern "C" */
+#endif
 
-#endif  // BROTLI_ENC_FAST_LOG_H_
+#endif  /* BROTLI_ENC_FAST_LOG_H_ */

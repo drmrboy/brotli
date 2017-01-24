@@ -1,686 +1,728 @@
-// Copyright 2010 Google Inc. All Rights Reserved.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-// http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-//
-// A (forgetful) hash table to the data seen by the compressor, to
-// help create backward references to previous data.
+/* Copyright 2010 Google Inc. All Rights Reserved.
+
+   Distributed under MIT license.
+   See file LICENSE for detail or copy at https://opensource.org/licenses/MIT
+*/
+
+/* A (forgetful) hash table to the data seen by the compressor, to
+   help create backward references to previous data. */
 
 #ifndef BROTLI_ENC_HASH_H_
 #define BROTLI_ENC_HASH_H_
 
-#include <stddef.h>
-#include <stdint.h>
-#include <string.h>
-#include <sys/types.h>
-#include <algorithm>
-#include <cstdlib>
-#include <memory>
-#include <string>
+#include <string.h>  /* memcmp, memset */
 
+#include "../common/constants.h"
+#include "../common/dictionary.h"
+#include <brotli/types.h>
 #include "./dictionary_hash.h"
 #include "./fast_log.h"
 #include "./find_match_length.h"
+#include "./memory.h"
 #include "./port.h"
-#include "./prefix.h"
+#include "./quality.h"
 #include "./static_dict.h"
-#include "./transform.h"
 
-namespace brotli {
+#if defined(__cplusplus) || defined(c_plusplus)
+extern "C" {
+#endif
 
-static const int kDistanceCacheIndex[] = {
+#define MAX_TREE_SEARCH_DEPTH 64
+#define MAX_TREE_COMP_LENGTH 128
+#define score_t size_t
+
+static const uint32_t kDistanceCacheIndex[] = {
   0, 1, 2, 3, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1,
 };
 static const int kDistanceCacheOffset[] = {
   0, 0, 0, 0, -1, 1, -2, 2, -3, 3, -1, 1, -2, 2, -3, 3
 };
 
-static const int kCutoffTransformsCount = 10;
-static const int kCutoffTransforms[] = {0, 12, 27, 23, 42, 63, 56, 48, 59, 64};
+static const uint32_t kCutoffTransformsCount = 10;
+static const uint8_t kCutoffTransforms[] = {
+  0, 12, 27, 23, 42, 63, 56, 48, 59, 64
+};
 
-// kHashMul32 multiplier has these properties:
-// * The multiplier must be odd. Otherwise we may lose the highest bit.
-// * No long streaks of 1s or 0s.
-// * There is no effort to ensure that it is a prime, the oddity is enough
-//   for this use.
-// * The number has been tuned heuristically against compression benchmarks.
+typedef struct HasherSearchResult {
+  size_t len;
+  size_t len_x_code; /* == len ^ len_code */
+  size_t distance;
+  score_t score;
+} HasherSearchResult;
+
+typedef struct DictionarySearchStatictics {
+  size_t num_lookups;
+  size_t num_matches;
+} DictionarySearchStatictics;
+
+/* kHashMul32 multiplier has these properties:
+   * The multiplier must be odd. Otherwise we may lose the highest bit.
+   * No long streaks of ones or zeros.
+   * There is no effort to ensure that it is a prime, the oddity is enough
+     for this use.
+   * The number has been tuned heuristically against compression benchmarks. */
 static const uint32_t kHashMul32 = 0x1e35a7bd;
 
-template<int kShiftBits>
-inline uint32_t Hash(const uint8_t *data) {
+static BROTLI_INLINE uint32_t Hash14(const uint8_t* data) {
   uint32_t h = BROTLI_UNALIGNED_LOAD32(data) * kHashMul32;
-  // The higher bits contain more mixture from the multiplication,
-  // so we take our results from there.
-  return h >> (32 - kShiftBits);
+  /* The higher bits contain more mixture from the multiplication,
+     so we take our results from there. */
+  return h >> (32 - 14);
 }
 
-// Usually, we always choose the longest backward reference. This function
-// allows for the exception of that rule.
-//
-// If we choose a backward reference that is further away, it will
-// usually be coded with more bits. We approximate this by assuming
-// log2(distance). If the distance can be expressed in terms of the
-// last four distances, we use some heuristic constants to estimate
-// the bits cost. For the first up to four literals we use the bit
-// cost of the literals from the literal cost model, after that we
-// use the average bit cost of the cost model.
-//
-// This function is used to sometimes discard a longer backward reference
-// when it is not much longer and the bit cost for encoding it is more
-// than the saved literals.
-inline double BackwardReferenceScore(int copy_length,
-                                     int backward_reference_offset) {
-  return 5.4 * copy_length - 1.20 * Log2Floor(backward_reference_offset);
+#define BROTLI_LITERAL_BYTE_SCORE 540
+#define BROTLI_DISTANCE_BIT_PENALTY 120
+/* Score must be positive after applying maximal penalty. */
+#define BROTLI_SCORE_BASE (BROTLI_DISTANCE_BIT_PENALTY * 8 * sizeof(size_t))
+
+/* Usually, we always choose the longest backward reference. This function
+   allows for the exception of that rule.
+
+   If we choose a backward reference that is further away, it will
+   usually be coded with more bits. We approximate this by assuming
+   log2(distance). If the distance can be expressed in terms of the
+   last four distances, we use some heuristic constants to estimate
+   the bits cost. For the first up to four literals we use the bit
+   cost of the literals from the literal cost model, after that we
+   use the average bit cost of the cost model.
+
+   This function is used to sometimes discard a longer backward reference
+   when it is not much longer and the bit cost for encoding it is more
+   than the saved literals.
+
+   backward_reference_offset MUST be positive. */
+static BROTLI_INLINE score_t BackwardReferenceScore(
+    size_t copy_length, size_t backward_reference_offset) {
+  return BROTLI_SCORE_BASE + BROTLI_LITERAL_BYTE_SCORE * (score_t)copy_length -
+      BROTLI_DISTANCE_BIT_PENALTY * Log2FloorNonZero(backward_reference_offset);
 }
 
-inline double BackwardReferenceScoreUsingLastDistance(int copy_length,
-                                                      int distance_short_code) {
-  static const double kDistanceShortCodeBitCost[16] = {
-    -0.6, 0.95, 1.17, 1.27,
-    0.93, 0.93, 0.96, 0.96, 0.99, 0.99,
-    1.05, 1.05, 1.15, 1.15, 1.25, 1.25
-  };
-  return 5.4 * copy_length - kDistanceShortCodeBitCost[distance_short_code];
-}
-
-struct BackwardMatch {
-  BackwardMatch() : distance(0), length_and_code(0) {}
-
-  BackwardMatch(int dist, int len)
-      : distance(dist), length_and_code((len << 5)) {}
-
-  BackwardMatch(int dist, int len, int len_code)
-      : distance(dist),
-        length_and_code((len << 5) | (len == len_code ? 0 : len_code)) {}
-
-  int length() const {
-    return length_and_code >> 5;
-  }
-  int length_code() const {
-    int code = length_and_code & 31;
-    return code ? code : length();
-  }
-
-  int distance;
-  int length_and_code;
+static const score_t kDistanceShortCodeCost[BROTLI_NUM_DISTANCE_SHORT_CODES] = {
+  /* Repeat last */
+  BROTLI_SCORE_BASE +  60,
+  /* 2nd, 3rd, 4th last */
+  BROTLI_SCORE_BASE -  95,
+  BROTLI_SCORE_BASE - 117,
+  BROTLI_SCORE_BASE - 127,
+  /* Last with offset */
+  BROTLI_SCORE_BASE -  93,
+  BROTLI_SCORE_BASE -  93,
+  BROTLI_SCORE_BASE -  96,
+  BROTLI_SCORE_BASE -  96,
+  BROTLI_SCORE_BASE -  99,
+  BROTLI_SCORE_BASE -  99,
+  /* 2nd last with offset */
+  BROTLI_SCORE_BASE - 105,
+  BROTLI_SCORE_BASE - 105,
+  BROTLI_SCORE_BASE - 115,
+  BROTLI_SCORE_BASE - 115,
+  BROTLI_SCORE_BASE - 125,
+  BROTLI_SCORE_BASE - 125
 };
 
-// A (forgetful) hash table to the data seen by the compressor, to
-// help create backward references to previous data.
-//
-// This is a hash map of fixed size (kBucketSize). Starting from the
-// given index, kBucketSweep buckets are used to store values of a key.
-template <int kBucketBits, int kBucketSweep, bool kUseDictionary>
-class HashLongestMatchQuickly {
- public:
-  HashLongestMatchQuickly() {
-    Reset();
-  }
-  void Reset() {
-    // It is not strictly necessary to fill this buffer here, but
-    // not filling will make the results of the compression stochastic
-    // (but correct). This is because random data would cause the
-    // system to find accidentally good backward references here and there.
-    memset(&buckets_[0], 0, sizeof(buckets_));
-    num_dict_lookups_ = 0;
-    num_dict_matches_ = 0;
-  }
-  // Look at 4 bytes at data.
-  // Compute a hash from these, and store the value somewhere within
-  // [ix .. ix+3].
-  inline void Store(const uint8_t *data, const int ix) {
-    const uint32_t key = HashBytes(data);
-    // Wiggle the value with the bucket sweep range.
-    const uint32_t off = (static_cast<uint32_t>(ix) >> 3) % kBucketSweep;
-    buckets_[key + off] = ix;
+static BROTLI_INLINE score_t BackwardReferenceScoreUsingLastDistance(
+    size_t copy_length, size_t distance_short_code) {
+  return BROTLI_LITERAL_BYTE_SCORE * (score_t)copy_length +
+      kDistanceShortCodeCost[distance_short_code];
+}
+
+static BROTLI_INLINE void DictionarySearchStaticticsReset(
+    DictionarySearchStatictics* self) {
+  self->num_lookups = 0;
+  self->num_matches = 0;
+}
+
+static BROTLI_INLINE BROTLI_BOOL TestStaticDictionaryItem(
+    size_t item, const uint8_t* data, size_t max_length, size_t max_backward,
+    HasherSearchResult* out) {
+  size_t len;
+  size_t dist;
+  size_t offset;
+  size_t matchlen;
+  size_t backward;
+  score_t score;
+  len = item & 31;
+  dist = item >> 5;
+  offset = kBrotliDictionaryOffsetsByLength[len] + len * dist;
+  if (len > max_length) {
+    return BROTLI_FALSE;
   }
 
-  // Store hashes for a range of data.
-  void StoreHashes(const uint8_t *data, size_t len, int startix, int mask) {
-    for (int p = 0; p < len; ++p) {
-      Store(&data[p & mask], startix + p);
+  matchlen = FindMatchLengthWithLimit(data, &kBrotliDictionary[offset], len);
+  if (matchlen + kCutoffTransformsCount <= len || matchlen == 0) {
+    return BROTLI_FALSE;
+  }
+  {
+    size_t transform_id = kCutoffTransforms[len - matchlen];
+    backward = max_backward + dist + 1 +
+        (transform_id << kBrotliDictionarySizeBitsByLength[len]);
+  }
+  score = BackwardReferenceScore(matchlen, backward);
+  if (score < out->score) {
+    return BROTLI_FALSE;
+  }
+  out->len = matchlen;
+  out->len_x_code = len ^ matchlen;
+  out->distance = backward;
+  out->score = score;
+  return BROTLI_TRUE;
+}
+
+static BROTLI_INLINE BROTLI_BOOL SearchInStaticDictionary(
+    DictionarySearchStatictics* self, const uint8_t* data, size_t max_length,
+    size_t max_backward, HasherSearchResult* out, BROTLI_BOOL shallow) {
+  size_t key;
+  size_t i;
+  BROTLI_BOOL is_match_found = BROTLI_FALSE;
+  if (self->num_matches < (self->num_lookups >> 7)) {
+    return BROTLI_FALSE;
+  }
+  key = Hash14(data) << 1;
+  for (i = 0; i < (shallow ? 1u : 2u); ++i, ++key) {
+    size_t item = kStaticDictionaryHash[key];
+    self->num_lookups++;
+    if (item != 0 &&
+        TestStaticDictionaryItem(item, data, max_length, max_backward, out)) {
+      self->num_matches++;
+      is_match_found = BROTLI_TRUE;
     }
   }
+  return is_match_found;
+}
 
-  // Find a longest backward match of &ring_buffer[cur_ix & ring_buffer_mask]
-  // up to the length of max_length.
-  //
-  // Does not look for matches longer than max_length.
-  // Does not look for matches further away than max_backward.
-  // Writes the best found match length into best_len_out.
-  // Writes the index (&data[index]) of the start of the best match into
-  // best_distance_out.
-  inline bool FindLongestMatch(const uint8_t * __restrict ring_buffer,
-                               const size_t ring_buffer_mask,
-                               const int* __restrict distance_cache,
-                               const uint32_t cur_ix,
-                               const uint32_t max_length,
-                               const uint32_t max_backward,
-                               int * __restrict best_len_out,
-                               int * __restrict best_len_code_out,
-                               int * __restrict best_distance_out,
-                               double* __restrict best_score_out) {
-    const int best_len_in = *best_len_out;
-    const int cur_ix_masked = cur_ix & ring_buffer_mask;
-    int compare_char = ring_buffer[cur_ix_masked + best_len_in];
-    double best_score = *best_score_out;
-    int best_len = best_len_in;
-    int backward = distance_cache[0];
-    size_t prev_ix = cur_ix - backward;
-    bool match_found = false;
-    if (prev_ix < cur_ix) {
-      prev_ix &= ring_buffer_mask;
-      if (compare_char == ring_buffer[prev_ix + best_len]) {
-        int len = FindMatchLengthWithLimit(&ring_buffer[prev_ix],
-                                           &ring_buffer[cur_ix_masked],
-                                           max_length);
-        if (len >= 4) {
-          best_score = BackwardReferenceScoreUsingLastDistance(len, 0);
-          best_len = len;
-          *best_len_out = len;
-          *best_len_code_out = len;
-          *best_distance_out = backward;
-          *best_score_out = best_score;
-          compare_char = ring_buffer[cur_ix_masked + best_len];
-          if (kBucketSweep == 1) {
-            return true;
-          } else {
-            match_found = true;
-          }
-        }
-      }
+typedef struct BackwardMatch {
+  uint32_t distance;
+  uint32_t length_and_code;
+} BackwardMatch;
+
+static BROTLI_INLINE void InitBackwardMatch(BackwardMatch* self,
+    size_t dist, size_t len) {
+  self->distance = (uint32_t)dist;
+  self->length_and_code = (uint32_t)(len << 5);
+}
+
+static BROTLI_INLINE void InitDictionaryBackwardMatch(BackwardMatch* self,
+    size_t dist, size_t len, size_t len_code) {
+  self->distance = (uint32_t)dist;
+  self->length_and_code =
+      (uint32_t)((len << 5) | (len == len_code ? 0 : len_code));
+}
+
+static BROTLI_INLINE size_t BackwardMatchLength(const BackwardMatch* self) {
+  return self->length_and_code >> 5;
+}
+
+static BROTLI_INLINE size_t BackwardMatchLengthCode(const BackwardMatch* self) {
+  size_t code = self->length_and_code & 31;
+  return code ? code : BackwardMatchLength(self);
+}
+
+#define EXPAND_CAT(a, b) CAT(a, b)
+#define CAT(a, b) a ## b
+#define FN(X) EXPAND_CAT(X, HASHER())
+
+#define MAX_NUM_MATCHES_H10 (64 + MAX_TREE_SEARCH_DEPTH)
+
+#define HASHER() H10
+#define HashToBinaryTree HASHER()
+
+#define BUCKET_BITS 17
+#define BUCKET_SIZE (1 << BUCKET_BITS)
+
+static size_t FN(HashTypeLength)(void) { return 4; }
+static size_t FN(StoreLookahead)(void) { return MAX_TREE_COMP_LENGTH; }
+
+static uint32_t FN(HashBytes)(const uint8_t *data) {
+  uint32_t h = BROTLI_UNALIGNED_LOAD32(data) * kHashMul32;
+  /* The higher bits contain more mixture from the multiplication,
+     so we take our results from there. */
+  return h >> (32 - BUCKET_BITS);
+}
+
+/* A (forgetful) hash table where each hash bucket contains a binary tree of
+   sequences whose first 4 bytes share the same hash code.
+   Each sequence is MAX_TREE_COMP_LENGTH long and is identified by its starting
+   position in the input data. The binary tree is sorted by the lexicographic
+   order of the sequences, and it is also a max-heap with respect to the
+   starting positions. */
+typedef struct HashToBinaryTree {
+  /* The window size minus 1 */
+  size_t window_mask_;
+
+  /* Hash table that maps the 4-byte hashes of the sequence to the last
+     position where this hash was found, which is the root of the binary
+     tree of sequences that share this hash bucket. */
+  uint32_t buckets_[BUCKET_SIZE];
+
+  /* The union of the binary trees of each hash bucket. The root of the tree
+     corresponding to a hash is a sequence starting at buckets_[hash] and
+     the left and right children of a sequence starting at pos are
+     forest_[2 * pos] and forest_[2 * pos + 1]. */
+  uint32_t* forest_;
+
+  /* A position used to mark a non-existent sequence, i.e. a tree is empty if
+     its root is at invalid_pos_ and a node is a leaf if both its children
+     are at invalid_pos_. */
+  uint32_t invalid_pos_;
+
+  size_t forest_size_;
+  BROTLI_BOOL is_dirty_;
+} HashToBinaryTree;
+
+static void FN(Reset)(HashToBinaryTree* self) {
+  self->is_dirty_ = BROTLI_TRUE;
+}
+
+static void FN(Initialize)(HashToBinaryTree* self) {
+  self->forest_ = NULL;
+  self->forest_size_ = 0;
+  FN(Reset)(self);
+}
+
+static void FN(Cleanup)(MemoryManager* m, HashToBinaryTree* self) {
+  BROTLI_FREE(m, self->forest_);
+}
+
+static void FN(Init)(
+    MemoryManager* m, HashToBinaryTree* self, const uint8_t* data,
+    const BrotliEncoderParams* params, size_t position, size_t bytes,
+    BROTLI_BOOL is_last) {
+  if (self->is_dirty_) {
+    uint32_t invalid_pos;
+    size_t num_nodes;
+    uint32_t i;
+    BROTLI_UNUSED(data);
+    self->window_mask_ = (1u << params->lgwin) - 1u;
+    invalid_pos = (uint32_t)(0 - self->window_mask_);
+    self->invalid_pos_ = invalid_pos;
+    for (i = 0; i < BUCKET_SIZE; i++) {
+      self->buckets_[i] = invalid_pos;
     }
-    const uint32_t key = HashBytes(&ring_buffer[cur_ix_masked]);
-    if (kBucketSweep == 1) {
-      // Only one to look for, don't bother to prepare for a loop.
-      prev_ix = buckets_[key];
-      backward = cur_ix - prev_ix;
-      prev_ix &= ring_buffer_mask;
-      if (compare_char != ring_buffer[prev_ix + best_len_in]) {
-        return false;
-      }
-      if (PREDICT_FALSE(backward == 0 || backward > max_backward)) {
-        return false;
-      }
-      const int len = FindMatchLengthWithLimit(&ring_buffer[prev_ix],
-                                               &ring_buffer[cur_ix_masked],
-                                               max_length);
-      if (len >= 4) {
-        *best_len_out = len;
-        *best_len_code_out = len;
-        *best_distance_out = backward;
-        *best_score_out = BackwardReferenceScore(len, backward);
-        return true;
-      }
-    } else {
-      uint32_t *bucket = buckets_ + key;
-      prev_ix = *bucket++;
-      for (int i = 0; i < kBucketSweep; ++i, prev_ix = *bucket++) {
-        const int backward = cur_ix - prev_ix;
-        prev_ix &= ring_buffer_mask;
-        if (compare_char != ring_buffer[prev_ix + best_len]) {
-          continue;
-        }
-        if (PREDICT_FALSE(backward == 0 || backward > max_backward)) {
-          continue;
-        }
-        const int len =
-            FindMatchLengthWithLimit(&ring_buffer[prev_ix],
-                                     &ring_buffer[cur_ix_masked],
-                                     max_length);
-        if (len >= 4) {
-          const double score = BackwardReferenceScore(len, backward);
-          if (best_score < score) {
-            best_score = score;
-            best_len = len;
-            *best_len_out = best_len;
-            *best_len_code_out = best_len;
-            *best_distance_out = backward;
-            *best_score_out = score;
-            compare_char = ring_buffer[cur_ix_masked + best_len];
-            match_found = true;
-          }
-        }
-      }
+    num_nodes = (position == 0 && is_last) ? bytes : self->window_mask_ + 1;
+    if (num_nodes > self->forest_size_) {
+      BROTLI_FREE(m, self->forest_);
+      self->forest_ = BROTLI_ALLOC(m, uint32_t, 2 * num_nodes);
+      if (BROTLI_IS_OOM(m)) return;
+      self->forest_size_ = num_nodes;
     }
-    if (kUseDictionary && !match_found &&
-        num_dict_matches_ >= (num_dict_lookups_ >> 7)) {
-      ++num_dict_lookups_;
-      const uint32_t key = Hash<14>(&ring_buffer[cur_ix_masked]) << 1;
-      const uint16_t v = kStaticDictionaryHash[key];
-      if (v > 0) {
-        const int len = v & 31;
-        const int dist = v >> 5;
-        const int offset = kBrotliDictionaryOffsetsByLength[len] + len * dist;
-        if (len <= max_length) {
-          const int matchlen =
-              FindMatchLengthWithLimit(&ring_buffer[cur_ix_masked],
-                                       &kBrotliDictionary[offset], len);
-          if (matchlen > len - kCutoffTransformsCount && matchlen > 0) {
-            const int transform_id = kCutoffTransforms[len - matchlen];
-            const int word_id =
-                transform_id * (1 << kBrotliDictionarySizeBitsByLength[len]) +
-                dist;
-            const size_t backward = max_backward + word_id + 1;
-            const double score = BackwardReferenceScore(matchlen, backward);
-            if (best_score < score) {
-              ++num_dict_matches_;
-              best_score = score;
-              best_len = matchlen;
-              *best_len_out = best_len;
-              *best_len_code_out = len;
-              *best_distance_out = backward;
-              *best_score_out = best_score;
-              return true;
-            }
-          }
-        }
+    self->is_dirty_ = BROTLI_FALSE;
+  }
+}
+
+static BROTLI_INLINE size_t FN(LeftChildIndex)(HashToBinaryTree* self,
+    const size_t pos) {
+  return 2 * (pos & self->window_mask_);
+}
+
+static BROTLI_INLINE size_t FN(RightChildIndex)(HashToBinaryTree* self,
+    const size_t pos) {
+  return 2 * (pos & self->window_mask_) + 1;
+}
+
+/* Stores the hash of the next 4 bytes and in a single tree-traversal, the
+   hash bucket's binary tree is searched for matches and is re-rooted at the
+   current position.
+
+   If less than MAX_TREE_COMP_LENGTH data is available, the hash bucket of the
+   current position is searched for matches, but the state of the hash table
+   is not changed, since we can not know the final sorting order of the
+   current (incomplete) sequence.
+
+   This function must be called with increasing cur_ix positions. */
+static BROTLI_INLINE BackwardMatch* FN(StoreAndFindMatches)(
+    HashToBinaryTree* self, const uint8_t* const BROTLI_RESTRICT data,
+    const size_t cur_ix, const size_t ring_buffer_mask, const size_t max_length,
+    const size_t max_backward, size_t* const BROTLI_RESTRICT best_len,
+    BackwardMatch* BROTLI_RESTRICT matches) {
+  const size_t cur_ix_masked = cur_ix & ring_buffer_mask;
+  const size_t max_comp_len =
+      BROTLI_MIN(size_t, max_length, MAX_TREE_COMP_LENGTH);
+  const BROTLI_BOOL should_reroot_tree =
+      TO_BROTLI_BOOL(max_length >= MAX_TREE_COMP_LENGTH);
+  const uint32_t key = FN(HashBytes)(&data[cur_ix_masked]);
+  size_t prev_ix = self->buckets_[key];
+  /* The forest index of the rightmost node of the left subtree of the new
+     root, updated as we traverse and re-root the tree of the hash bucket. */
+  size_t node_left = FN(LeftChildIndex)(self, cur_ix);
+  /* The forest index of the leftmost node of the right subtree of the new
+     root, updated as we traverse and re-root the tree of the hash bucket. */
+  size_t node_right = FN(RightChildIndex)(self, cur_ix);
+  /* The match length of the rightmost node of the left subtree of the new
+     root, updated as we traverse and re-root the tree of the hash bucket. */
+  size_t best_len_left = 0;
+  /* The match length of the leftmost node of the right subtree of the new
+     root, updated as we traverse and re-root the tree of the hash bucket. */
+  size_t best_len_right = 0;
+  size_t depth_remaining;
+  if (should_reroot_tree) {
+    self->buckets_[key] = (uint32_t)cur_ix;
+  }
+  for (depth_remaining = MAX_TREE_SEARCH_DEPTH; ; --depth_remaining) {
+    const size_t backward = cur_ix - prev_ix;
+    const size_t prev_ix_masked = prev_ix & ring_buffer_mask;
+    if (backward == 0 || backward > max_backward || depth_remaining == 0) {
+      if (should_reroot_tree) {
+        self->forest_[node_left] = self->invalid_pos_;
+        self->forest_[node_right] = self->invalid_pos_;
       }
+      break;
     }
-    return match_found;
-  }
-
-  enum { kHashLength = 5 };
-  enum { kHashTypeLength = 8 };
-  // HashBytes is the function that chooses the bucket to place
-  // the address in. The HashLongestMatch and HashLongestMatchQuickly
-  // classes have separate, different implementations of hashing.
-  static uint32_t HashBytes(const uint8_t *data) {
-    // Computing a hash based on 5 bytes works much better for
-    // qualities 1 and 3, where the next hash value is likely to replace
-    static const uint32_t kHashMul32 = 0x1e35a7bd;
-    uint64_t h = (BROTLI_UNALIGNED_LOAD64(data) << 24) * kHashMul32;
-    // The higher bits contain more mixture from the multiplication,
-    // so we take our results from there.
-    return h >> (64 - kBucketBits);
-  }
-
- private:
-  static const uint32_t kBucketSize = 1 << kBucketBits;
-  uint32_t buckets_[kBucketSize + kBucketSweep];
-  size_t num_dict_lookups_;
-  size_t num_dict_matches_;
-};
-
-// The maximum length for which the zopflification uses distinct distances.
-static const int kMaxZopfliLen = 325;
-
-// A (forgetful) hash table to the data seen by the compressor, to
-// help create backward references to previous data.
-//
-// This is a hash map of fixed size (kBucketSize) to a ring buffer of
-// fixed size (kBlockSize). The ring buffer contains the last kBlockSize
-// index positions of the given hash key in the compressed data.
-template <int kBucketBits,
-          int kBlockBits,
-          int kNumLastDistancesToCheck>
-class HashLongestMatch {
- public:
-  HashLongestMatch() {
-    Reset();
-  }
-
-  void Reset() {
-    memset(&num_[0], 0, sizeof(num_));
-    num_dict_lookups_ = 0;
-    num_dict_matches_ = 0;
-  }
-
-  // Look at 3 bytes at data.
-  // Compute a hash from these, and store the value of ix at that position.
-  inline void Store(const uint8_t *data, const int ix) {
-    const uint32_t key = HashBytes(data);
-    const int minor_ix = num_[key] & kBlockMask;
-    buckets_[key][minor_ix] = ix;
-    ++num_[key];
-  }
-
-  // Store hashes for a range of data.
-  void StoreHashes(const uint8_t *data, size_t len, int startix, int mask) {
-    for (int p = 0; p < len; ++p) {
-      Store(&data[p & mask], startix + p);
-    }
-  }
-
-  // Find a longest backward match of &data[cur_ix] up to the length of
-  // max_length.
-  //
-  // Does not look for matches longer than max_length.
-  // Does not look for matches further away than max_backward.
-  // Writes the best found match length into best_len_out.
-  // Writes the index (&data[index]) offset from the start of the best match
-  // into best_distance_out.
-  // Write the score of the best match into best_score_out.
-  bool FindLongestMatch(const uint8_t * __restrict data,
-                        const size_t ring_buffer_mask,
-                        const int* __restrict distance_cache,
-                        const uint32_t cur_ix,
-                        uint32_t max_length,
-                        const uint32_t max_backward,
-                        int * __restrict best_len_out,
-                        int * __restrict best_len_code_out,
-                        int * __restrict best_distance_out,
-                        double * __restrict best_score_out) {
-    *best_len_code_out = 0;
-    const size_t cur_ix_masked = cur_ix & ring_buffer_mask;
-    bool match_found = false;
-    // Don't accept a short copy from far away.
-    double best_score = *best_score_out;
-    int best_len = *best_len_out;
-    *best_len_out = 0;
-    // Try last distance first.
-    for (int i = 0; i < kNumLastDistancesToCheck; ++i) {
-      const int idx = kDistanceCacheIndex[i];
-      const int backward = distance_cache[idx] + kDistanceCacheOffset[i];
-      size_t prev_ix = cur_ix - backward;
-      if (prev_ix >= cur_ix) {
-        continue;
+    {
+      const size_t cur_len = BROTLI_MIN(size_t, best_len_left, best_len_right);
+      size_t len;
+      assert(cur_len <= MAX_TREE_COMP_LENGTH);
+      len = cur_len +
+          FindMatchLengthWithLimit(&data[cur_ix_masked + cur_len],
+                                   &data[prev_ix_masked + cur_len],
+                                   max_length - cur_len);
+      assert(0 == memcmp(&data[cur_ix_masked], &data[prev_ix_masked], len));
+      if (matches && len > *best_len) {
+        *best_len = len;
+        InitBackwardMatch(matches++, backward, len);
       }
-      if (PREDICT_FALSE(backward > max_backward)) {
-        continue;
-      }
-      prev_ix &= ring_buffer_mask;
-
-      if (cur_ix_masked + best_len > ring_buffer_mask ||
-          prev_ix + best_len > ring_buffer_mask ||
-          data[cur_ix_masked + best_len] != data[prev_ix + best_len]) {
-        continue;
-      }
-      const size_t len =
-          FindMatchLengthWithLimit(&data[prev_ix], &data[cur_ix_masked],
-                                   max_length);
-      if (len >= 3 || (len == 2 && i < 2)) {
-        // Comparing for >= 2 does not change the semantics, but just saves for
-        // a few unnecessary binary logarithms in backward reference score,
-        // since we are not interested in such short matches.
-        double score = BackwardReferenceScoreUsingLastDistance(len, i);
-        if (best_score < score) {
-          best_score = score;
-          best_len = len;
-          *best_len_out = best_len;
-          *best_len_code_out = best_len;
-          *best_distance_out = backward;
-          *best_score_out = best_score;
-          match_found = true;
+      if (len >= max_comp_len) {
+        if (should_reroot_tree) {
+          self->forest_[node_left] =
+              self->forest_[FN(LeftChildIndex)(self, prev_ix)];
+          self->forest_[node_right] =
+              self->forest_[FN(RightChildIndex)(self, prev_ix)];
         }
-      }
-    }
-    const uint32_t key = HashBytes(&data[cur_ix_masked]);
-    const int * __restrict const bucket = &buckets_[key][0];
-    const int down = (num_[key] > kBlockSize) ? (num_[key] - kBlockSize) : 0;
-    for (int i = num_[key] - 1; i >= down; --i) {
-      int prev_ix = bucket[i & kBlockMask];
-      if (prev_ix >= 0) {
-        const size_t backward = cur_ix - prev_ix;
-        if (PREDICT_FALSE(backward > max_backward)) {
-          break;
-        }
-        prev_ix &= ring_buffer_mask;
-        if (cur_ix_masked + best_len > ring_buffer_mask ||
-            prev_ix + best_len > ring_buffer_mask ||
-            data[cur_ix_masked + best_len] != data[prev_ix + best_len]) {
-          continue;
-        }
-        const size_t len =
-            FindMatchLengthWithLimit(&data[prev_ix], &data[cur_ix_masked],
-                                     max_length);
-        if (len >= 4) {
-          // Comparing for >= 3 does not change the semantics, but just saves
-          // for a few unnecessary binary logarithms in backward reference
-          // score, since we are not interested in such short matches.
-          double score = BackwardReferenceScore(len, backward);
-          if (best_score < score) {
-            best_score = score;
-            best_len = len;
-            *best_len_out = best_len;
-            *best_len_code_out = best_len;
-            *best_distance_out = backward;
-            *best_score_out = best_score;
-            match_found = true;
-          }
-        }
-      }
-    }
-    if (!match_found && num_dict_matches_ >= (num_dict_lookups_ >> 7)) {
-      uint32_t key = Hash<14>(&data[cur_ix_masked]) << 1;
-      for (int k = 0; k < 2; ++k, ++key) {
-        ++num_dict_lookups_;
-        const uint16_t v = kStaticDictionaryHash[key];
-        if (v > 0) {
-          const int len = v & 31;
-          const int dist = v >> 5;
-          const int offset = kBrotliDictionaryOffsetsByLength[len] + len * dist;
-          if (len <= max_length) {
-            const int matchlen =
-                FindMatchLengthWithLimit(&data[cur_ix_masked],
-                                         &kBrotliDictionary[offset], len);
-            if (matchlen > len - kCutoffTransformsCount && matchlen > 0) {
-              const int transform_id = kCutoffTransforms[len - matchlen];
-              const int word_id =
-                  transform_id * (1 << kBrotliDictionarySizeBitsByLength[len]) +
-                  dist;
-              const size_t backward = max_backward + word_id + 1;
-              double score = BackwardReferenceScore(matchlen, backward);
-              if (best_score < score) {
-                ++num_dict_matches_;
-                best_score = score;
-                best_len = matchlen;
-                *best_len_out = best_len;
-                *best_len_code_out = len;
-                *best_distance_out = backward;
-                *best_score_out = best_score;
-                match_found = true;
-              }
-            }
-          }
-        }
-      }
-    }
-    return match_found;
-  }
-
-  // Similar to FindLongestMatch(), but finds all matches.
-  //
-  // Sets *num_matches to the number of matches found, and stores the found
-  // matches in matches[0] to matches[*num_matches - 1].
-  //
-  // If the longest match is longer than kMaxZopfliLen, returns only this
-  // longest match.
-  //
-  // Requires that at least kMaxZopfliLen space is available in matches.
-  void FindAllMatches(const uint8_t* data,
-                      const size_t ring_buffer_mask,
-                      const uint32_t cur_ix,
-                      uint32_t max_length,
-                      const uint32_t max_backward,
-                      int* num_matches,
-                      BackwardMatch* matches) const {
-    BackwardMatch* const orig_matches = matches;
-    const size_t cur_ix_masked = cur_ix & ring_buffer_mask;
-    int best_len = 1;
-    int stop = static_cast<int>(cur_ix) - 64;
-    if (stop < 0) { stop = 0; }
-    for (int i = cur_ix - 1; i > stop && best_len <= 2; --i) {
-      size_t prev_ix = i;
-      const size_t backward = cur_ix - prev_ix;
-      if (PREDICT_FALSE(backward > max_backward)) {
         break;
       }
-      prev_ix &= ring_buffer_mask;
-      if (data[cur_ix_masked] != data[prev_ix] ||
-          data[cur_ix_masked + 1] != data[prev_ix + 1]) {
-        continue;
+      if (data[cur_ix_masked + len] > data[prev_ix_masked + len]) {
+        best_len_left = len;
+        if (should_reroot_tree) {
+          self->forest_[node_left] = (uint32_t)prev_ix;
+        }
+        node_left = FN(RightChildIndex)(self, prev_ix);
+        prev_ix = self->forest_[node_left];
+      } else {
+        best_len_right = len;
+        if (should_reroot_tree) {
+          self->forest_[node_right] = (uint32_t)prev_ix;
+        }
+        node_right = FN(LeftChildIndex)(self, prev_ix);
+        prev_ix = self->forest_[node_right];
       }
+    }
+  }
+  return matches;
+}
+
+/* Finds all backward matches of &data[cur_ix & ring_buffer_mask] up to the
+   length of max_length and stores the position cur_ix in the hash table.
+
+   Sets *num_matches to the number of matches found, and stores the found
+   matches in matches[0] to matches[*num_matches - 1]. The matches will be
+   sorted by strictly increasing length and (non-strictly) increasing
+   distance. */
+static BROTLI_INLINE size_t FN(FindAllMatches)(HashToBinaryTree* self,
+    const uint8_t* data, const size_t ring_buffer_mask, const size_t cur_ix,
+    const size_t max_length, const size_t max_backward,
+    const BrotliEncoderParams* params, BackwardMatch* matches) {
+  BackwardMatch* const orig_matches = matches;
+  const size_t cur_ix_masked = cur_ix & ring_buffer_mask;
+  size_t best_len = 1;
+  const size_t short_match_max_backward =
+      params->quality != HQ_ZOPFLIFICATION_QUALITY ? 16 : 64;
+  size_t stop = cur_ix - short_match_max_backward;
+  uint32_t dict_matches[BROTLI_MAX_STATIC_DICTIONARY_MATCH_LEN + 1];
+  size_t i;
+  if (cur_ix < short_match_max_backward) { stop = 0; }
+  for (i = cur_ix - 1; i > stop && best_len <= 2; --i) {
+    size_t prev_ix = i;
+    const size_t backward = cur_ix - prev_ix;
+    if (BROTLI_PREDICT_FALSE(backward > max_backward)) {
+      break;
+    }
+    prev_ix &= ring_buffer_mask;
+    if (data[cur_ix_masked] != data[prev_ix] ||
+        data[cur_ix_masked + 1] != data[prev_ix + 1]) {
+      continue;
+    }
+    {
       const size_t len =
           FindMatchLengthWithLimit(&data[prev_ix], &data[cur_ix_masked],
                                    max_length);
       if (len > best_len) {
         best_len = len;
-        if (len > kMaxZopfliLen) {
-          matches = orig_matches;
-        }
-        *matches++ = BackwardMatch(backward, len);
+        InitBackwardMatch(matches++, backward, len);
       }
     }
-    const uint32_t key = HashBytes(&data[cur_ix_masked]);
-    const int * __restrict const bucket = &buckets_[key][0];
-    const int down = (num_[key] > kBlockSize) ? (num_[key] - kBlockSize) : 0;
-    for (int i = num_[key] - 1; i >= down; --i) {
-      int prev_ix = bucket[i & kBlockMask];
-      if (prev_ix >= 0) {
-        const size_t backward = cur_ix - prev_ix;
-        if (PREDICT_FALSE(backward > max_backward)) {
-          break;
-        }
-        prev_ix &= ring_buffer_mask;
-        if (cur_ix_masked + best_len > ring_buffer_mask ||
-            prev_ix + best_len > ring_buffer_mask ||
-            data[cur_ix_masked + best_len] != data[prev_ix + best_len]) {
-          continue;
-        }
-        const size_t len =
-            FindMatchLengthWithLimit(&data[prev_ix], &data[cur_ix_masked],
-                                     max_length);
-        if (len > best_len) {
-          best_len = len;
-          if (len > kMaxZopfliLen) {
-            matches = orig_matches;
-          }
-          *matches++ = BackwardMatch(backward, len);
-        }
-      }
-    }
-    std::vector<int> dict_matches(kMaxDictionaryMatchLen + 1, kInvalidMatch);
-    int minlen = std::max<int>(4, best_len + 1);
-    if (FindAllStaticDictionaryMatches(&data[cur_ix_masked], minlen, max_length,
-                                       &dict_matches[0])) {
-      int maxlen = std::min<int>(kMaxDictionaryMatchLen, max_length);
-      for (int l = minlen; l <= maxlen; ++l) {
-        int dict_id = dict_matches[l];
+  }
+  if (best_len < max_length) {
+    matches = FN(StoreAndFindMatches)(self, data, cur_ix, ring_buffer_mask,
+        max_length, max_backward, &best_len, matches);
+  }
+  for (i = 0; i <= BROTLI_MAX_STATIC_DICTIONARY_MATCH_LEN; ++i) {
+    dict_matches[i] = kInvalidMatch;
+  }
+  {
+    size_t minlen = BROTLI_MAX(size_t, 4, best_len + 1);
+    if (BrotliFindAllStaticDictionaryMatches(&data[cur_ix_masked], minlen,
+                                             max_length, &dict_matches[0])) {
+      size_t maxlen = BROTLI_MIN(
+          size_t, BROTLI_MAX_STATIC_DICTIONARY_MATCH_LEN, max_length);
+      size_t l;
+      for (l = minlen; l <= maxlen; ++l) {
+        uint32_t dict_id = dict_matches[l];
         if (dict_id < kInvalidMatch) {
-          *matches++ = BackwardMatch(max_backward + (dict_id >> 5) + 1, l,
-                                     dict_id & 31);
+          InitDictionaryBackwardMatch(matches++,
+              max_backward + (dict_id >> 5) + 1, l, dict_id & 31);
         }
       }
     }
-    *num_matches += matches - orig_matches;
   }
+  return (size_t)(matches - orig_matches);
+}
 
-  enum { kHashLength = 4 };
-  enum { kHashTypeLength = 4 };
+/* Stores the hash of the next 4 bytes and re-roots the binary tree at the
+   current sequence, without returning any matches.
+   REQUIRES: ix + MAX_TREE_COMP_LENGTH <= end-of-current-block */
+static BROTLI_INLINE void FN(Store)(HashToBinaryTree* self, const uint8_t *data,
+    const size_t mask, const size_t ix) {
+  /* Maximum distance is window size - 16, see section 9.1. of the spec. */
+  const size_t max_backward = self->window_mask_ - BROTLI_WINDOW_GAP + 1;
+  FN(StoreAndFindMatches)(self, data, ix, mask, MAX_TREE_COMP_LENGTH,
+      max_backward, NULL, NULL);
+}
 
-  // HashBytes is the function that chooses the bucket to place
-  // the address in. The HashLongestMatch and HashLongestMatchQuickly
-  // classes have separate, different implementations of hashing.
-  static uint32_t HashBytes(const uint8_t *data) {
-    // kHashMul32 multiplier has these properties:
-    // * The multiplier must be odd. Otherwise we may lose the highest bit.
-    // * No long streaks of 1s or 0s.
-    // * Is not unfortunate (see the unittest) for the English language.
-    // * There is no effort to ensure that it is a prime, the oddity is enough
-    //   for this use.
-    // * The number has been tuned heuristically against compression benchmarks.
-    static const uint32_t kHashMul32 = 0x1e35a7bd;
-    uint32_t h = BROTLI_UNALIGNED_LOAD32(data) * kHashMul32;
-    // The higher bits contain more mixture from the multiplication,
-    // so we take our results from there.
-    return h >> (32 - kBucketBits);
+static BROTLI_INLINE void FN(StoreRange)(HashToBinaryTree* self,
+    const uint8_t *data, const size_t mask, const size_t ix_start,
+    const size_t ix_end) {
+  size_t i = ix_start;
+  size_t j = ix_start;
+  if (ix_start + 63 <= ix_end) {
+    i = ix_end - 63;
   }
-
- private:
-  // Number of hash buckets.
-  static const uint32_t kBucketSize = 1 << kBucketBits;
-
-  // Only kBlockSize newest backward references are kept,
-  // and the older are forgotten.
-  static const uint32_t kBlockSize = 1 << kBlockBits;
-
-  // Mask for accessing entries in a block (in a ringbuffer manner).
-  static const uint32_t kBlockMask = (1 << kBlockBits) - 1;
-
-  // Number of entries in a particular bucket.
-  uint16_t num_[kBucketSize];
-
-  // Buckets containing kBlockSize of backward references.
-  int buckets_[kBucketSize][kBlockSize];
-
-  size_t num_dict_lookups_;
-  size_t num_dict_matches_;
-};
-
-struct Hashers {
-  // For kBucketSweep == 1, enabling the dictionary lookup makes compression
-  // a little faster (0.5% - 1%) and it compresses 0.15% better on small text
-  // and html inputs.
-  typedef HashLongestMatchQuickly<16, 1, true> H1;
-  typedef HashLongestMatchQuickly<16, 2, false> H2;
-  typedef HashLongestMatchQuickly<16, 4, false> H3;
-  typedef HashLongestMatchQuickly<17, 4, true> H4;
-  typedef HashLongestMatch<14, 4, 4> H5;
-  typedef HashLongestMatch<14, 5, 4> H6;
-  typedef HashLongestMatch<15, 6, 10> H7;
-  typedef HashLongestMatch<15, 7, 10> H8;
-  typedef HashLongestMatch<15, 8, 16> H9;
-
-  void Init(int type) {
-    switch (type) {
-      case 1: hash_h1.reset(new H1); break;
-      case 2: hash_h2.reset(new H2); break;
-      case 3: hash_h3.reset(new H3); break;
-      case 4: hash_h4.reset(new H4); break;
-      case 5: hash_h5.reset(new H5); break;
-      case 6: hash_h6.reset(new H6); break;
-      case 7: hash_h7.reset(new H7); break;
-      case 8: hash_h8.reset(new H8); break;
-      case 9: hash_h9.reset(new H9); break;
-      default: break;
+  if (ix_start + 512 <= i) {
+    for (; j < i; j += 8) {
+      FN(Store)(self, data, mask, j);
     }
   }
+  for (; i < ix_end; ++i) {
+    FN(Store)(self, data, mask, i);
+  }
+}
 
-  template<typename Hasher>
-  void WarmupHash(const size_t size, const uint8_t* dict, Hasher* hasher) {
-    for (size_t i = 0; i + Hasher::kHashTypeLength - 1 < size; i++) {
-      hasher->Store(dict, i);
+static BROTLI_INLINE void FN(StitchToPreviousBlock)(HashToBinaryTree* self,
+    size_t num_bytes, size_t position, const uint8_t* ringbuffer,
+    size_t ringbuffer_mask) {
+  if (num_bytes >= FN(HashTypeLength)() - 1 &&
+      position >= MAX_TREE_COMP_LENGTH) {
+    /* Store the last `MAX_TREE_COMP_LENGTH - 1` positions in the hasher.
+       These could not be calculated before, since they require knowledge
+       of both the previous and the current block. */
+    const size_t i_start = position - MAX_TREE_COMP_LENGTH + 1;
+    const size_t i_end = BROTLI_MIN(size_t, position, i_start + num_bytes);
+    size_t i;
+    for (i = i_start; i < i_end; ++i) {
+      /* Maximum distance is window size - 16, see section 9.1. of the spec.
+         Furthermore, we have to make sure that we don't look further back
+         from the start of the next block than the window size, otherwise we
+         could access already overwritten areas of the ring-buffer. */
+      const size_t max_backward =
+          self->window_mask_ - BROTLI_MAX(size_t,
+                                          BROTLI_WINDOW_GAP - 1,
+                                          position - i);
+      /* We know that i + MAX_TREE_COMP_LENGTH <= position + num_bytes, i.e. the
+         end of the current block and that we have at least
+         MAX_TREE_COMP_LENGTH tail in the ring-buffer. */
+      FN(StoreAndFindMatches)(self, ringbuffer, i, ringbuffer_mask,
+          MAX_TREE_COMP_LENGTH, max_backward, NULL, NULL);
     }
   }
+}
 
-  // Custom LZ77 window.
-  void PrependCustomDictionary(
-      int type, const size_t size, const uint8_t* dict) {
-    switch (type) {
-      case 1: WarmupHash(size, dict, hash_h1.get()); break;
-      case 2: WarmupHash(size, dict, hash_h2.get()); break;
-      case 3: WarmupHash(size, dict, hash_h3.get()); break;
-      case 4: WarmupHash(size, dict, hash_h4.get()); break;
-      case 5: WarmupHash(size, dict, hash_h5.get()); break;
-      case 6: WarmupHash(size, dict, hash_h6.get()); break;
-      case 7: WarmupHash(size, dict, hash_h7.get()); break;
-      case 8: WarmupHash(size, dict, hash_h8.get()); break;
-      case 9: WarmupHash(size, dict, hash_h9.get()); break;
-      default: break;
-    }
+#undef BUCKET_SIZE
+#undef BUCKET_BITS
+
+#undef HASHER
+
+/* For BUCKET_SWEEP == 1, enabling the dictionary lookup makes compression
+   a little faster (0.5% - 1%) and it compresses 0.15% better on small text
+   and HTML inputs. */
+
+#define HASHER() H2
+#define BUCKET_BITS 16
+#define BUCKET_SWEEP 1
+#define USE_DICTIONARY 1
+#include "./hash_longest_match_quickly_inc.h"  /* NOLINT(build/include) */
+#undef BUCKET_SWEEP
+#undef USE_DICTIONARY
+#undef HASHER
+
+#define HASHER() H3
+#define BUCKET_SWEEP 2
+#define USE_DICTIONARY 0
+#include "./hash_longest_match_quickly_inc.h"  /* NOLINT(build/include) */
+#undef USE_DICTIONARY
+#undef BUCKET_SWEEP
+#undef BUCKET_BITS
+#undef HASHER
+
+#define HASHER() H4
+#define BUCKET_BITS 17
+#define BUCKET_SWEEP 4
+#define USE_DICTIONARY 1
+#include "./hash_longest_match_quickly_inc.h"  /* NOLINT(build/include) */
+#undef USE_DICTIONARY
+#undef BUCKET_SWEEP
+#undef BUCKET_BITS
+#undef HASHER
+
+#define HASHER() H5
+#define BUCKET_BITS 14
+#define BLOCK_BITS 4
+#define NUM_LAST_DISTANCES_TO_CHECK 4
+#include "./hash_longest_match_inc.h"  /* NOLINT(build/include) */
+#undef BLOCK_BITS
+#undef HASHER
+
+#define HASHER() H6
+#define BLOCK_BITS 5
+#include "./hash_longest_match_inc.h"  /* NOLINT(build/include) */
+#undef NUM_LAST_DISTANCES_TO_CHECK
+#undef BLOCK_BITS
+#undef BUCKET_BITS
+#undef HASHER
+
+#define HASHER() H7
+#define BUCKET_BITS 15
+#define BLOCK_BITS 6
+#define NUM_LAST_DISTANCES_TO_CHECK 10
+#include "./hash_longest_match_inc.h"  /* NOLINT(build/include) */
+#undef BLOCK_BITS
+#undef HASHER
+
+#define HASHER() H8
+#define BLOCK_BITS 7
+#include "./hash_longest_match_inc.h"  /* NOLINT(build/include) */
+#undef NUM_LAST_DISTANCES_TO_CHECK
+#undef BLOCK_BITS
+#undef HASHER
+
+#define HASHER() H9
+#define BLOCK_BITS 8
+#define NUM_LAST_DISTANCES_TO_CHECK 16
+#include "./hash_longest_match_inc.h"  /* NOLINT(build/include) */
+#undef NUM_LAST_DISTANCES_TO_CHECK
+#undef BLOCK_BITS
+#undef BUCKET_BITS
+#undef HASHER
+
+#define BUCKET_BITS 15
+
+#define NUM_LAST_DISTANCES_TO_CHECK 4
+#define NUM_BANKS 1
+#define BANK_BITS 16
+#define HASHER() H40
+#include "./hash_forgetful_chain_inc.h"  /* NOLINT(build/include) */
+#undef HASHER
+#undef NUM_LAST_DISTANCES_TO_CHECK
+
+#define NUM_LAST_DISTANCES_TO_CHECK 10
+#define HASHER() H41
+#include "./hash_forgetful_chain_inc.h"  /* NOLINT(build/include) */
+#undef HASHER
+#undef NUM_LAST_DISTANCES_TO_CHECK
+#undef NUM_BANKS
+#undef BANK_BITS
+
+#define NUM_LAST_DISTANCES_TO_CHECK 16
+#define NUM_BANKS 512
+#define BANK_BITS 9
+#define HASHER() H42
+#include "./hash_forgetful_chain_inc.h"  /* NOLINT(build/include) */
+#undef HASHER
+#undef NUM_LAST_DISTANCES_TO_CHECK
+#undef NUM_BANKS
+#undef BANK_BITS
+
+#undef BUCKET_BITS
+
+#undef FN
+#undef CAT
+#undef EXPAND_CAT
+
+#define FOR_GENERIC_HASHERS(H) H(2) H(3) H(4) H(5) H(6) H(7) H(8) H(9) \
+                               H(40) H(41) H(42)
+#define FOR_ALL_HASHERS(H) FOR_GENERIC_HASHERS(H) H(10)
+
+typedef struct Hashers {
+#define MEMBER_(N) H ## N* h ## N;
+  FOR_ALL_HASHERS(MEMBER_)
+#undef MEMBER_
+} Hashers;
+
+static BROTLI_INLINE void InitHashers(Hashers* self) {
+#define INIT_(N) self->h ## N = 0;
+  FOR_ALL_HASHERS(INIT_)
+#undef INIT_
+}
+
+static BROTLI_INLINE void DestroyHashers(MemoryManager* m, Hashers* self) {
+  if (self->h10) CleanupH10(m, self->h10);
+#define CLEANUP_(N) BROTLI_FREE(m, self->h ## N)
+  FOR_ALL_HASHERS(CLEANUP_)
+#undef CLEANUP_
+}
+
+static BROTLI_INLINE void HashersReset(Hashers* self, int type) {
+  switch (type) {
+#define RESET_(N) case N: ResetH ## N(self->h ## N); break;
+    FOR_ALL_HASHERS(RESET_)
+#undef RESET_
+    default: break;
   }
+}
 
-  std::unique_ptr<H1> hash_h1;
-  std::unique_ptr<H2> hash_h2;
-  std::unique_ptr<H3> hash_h3;
-  std::unique_ptr<H4> hash_h4;
-  std::unique_ptr<H5> hash_h5;
-  std::unique_ptr<H6> hash_h6;
-  std::unique_ptr<H7> hash_h7;
-  std::unique_ptr<H8> hash_h8;
-  std::unique_ptr<H9> hash_h9;
-};
+static BROTLI_INLINE void HashersSetup(
+    MemoryManager* m, Hashers* self, int type) {
+  switch (type) {
+#define SETUP_(N) case N: self->h ## N = BROTLI_ALLOC(m, H ## N, 1); break;
+    FOR_ALL_HASHERS(SETUP_)
+#undef SETUP_
+    default: break;
+  }
+  if (BROTLI_IS_OOM(m)) return;
+  if (type == 10) InitializeH10(self->h10);
+  HashersReset(self, type);
+}
 
-}  // namespace brotli
+#define WARMUP_HASH_(N)                                                        \
+static BROTLI_INLINE void WarmupHashH ## N(MemoryManager* m,                   \
+    const BrotliEncoderParams* params, const size_t size, const uint8_t* dict, \
+    H ## N* hasher) {                                                          \
+  size_t overlap = (StoreLookaheadH ## N()) - 1;                               \
+  size_t i;                                                                    \
+  InitH ## N(m, hasher, dict, params, 0, size, BROTLI_FALSE);                  \
+  if (BROTLI_IS_OOM(m)) return;                                                \
+  for (i = 0; i + overlap < size; i++) {                                       \
+    StoreH ## N(hasher, dict, ~(size_t)0, i);                                  \
+  }                                                                            \
+}
+FOR_ALL_HASHERS(WARMUP_HASH_)
+#undef WARMUP_HASH_
 
-#endif  // BROTLI_ENC_HASH_H_
+/* Custom LZ77 window. */
+static BROTLI_INLINE void HashersPrependCustomDictionary(
+    MemoryManager* m, Hashers* self, const BrotliEncoderParams* params,
+    const size_t size, const uint8_t* dict) {
+  int hasher_type = ChooseHasher(params);
+  switch (hasher_type) {
+#define PREPEND_(N) \
+    case N: WarmupHashH ## N(m, params, size, dict, self->h ## N); break;
+    FOR_ALL_HASHERS(PREPEND_)
+#undef PREPEND_
+    default: break;
+  }
+  if (BROTLI_IS_OOM(m)) return;
+}
+
+
+#if defined(__cplusplus) || defined(c_plusplus)
+}  /* extern "C" */
+#endif
+
+#endif  /* BROTLI_ENC_HASH_H_ */
